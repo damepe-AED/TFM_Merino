@@ -6,9 +6,9 @@ on Barabási-Albert (BA) networks.
 
 Reference:
   Pereira et al. "Effective Heuristics for the Perfect Awareness Problem"
-  Procedia Computer Science 195 (2021) 489–498.
+  Procedia Computer Science 195 (2021) 489-498.
 
-Author: Daniela Meriño Pérez  (TFM – Máster en Ciencia de Datos, UV)
+Author: Daniela Meriño Pérez  (TFM - Máster en Ciencia de Datos, UV)
 """
 
 import math
@@ -105,21 +105,66 @@ def is_perfect_seed(G: nx.Graph, seed_set: Set[int]) -> bool:
 # ──────────────────────────────────────────────────────────────
 
 @dataclass
+@dataclass
 class CentralityCache:
-    degree:      Dict[int, float]
+    degree: Dict[int, float]
     eigenvector: Dict[int, float]
     betweenness: Dict[int, float]
+    time_degree: float = 0.0
+    time_eigenvector: float = 0.0
+    time_betweenness: float = 0.0
+    time_total: float = 0.0
 
     @classmethod
-    def compute(cls, G: nx.Graph) -> "CentralityCache":
-        deg = nx.degree_centrality(G)
-        try:
-            eig = nx.eigenvector_centrality(G, max_iter=500)
-        except nx.PowerIterationFailedConvergence:
-            eig = deg  # fallback
-        bet = nx.betweenness_centrality(G, normalized=True)
-        return cls(degree=deg, eigenvector=eig, betweenness=bet)
+    def compute(
+        cls,
+        G: nx.Graph,
+        use_degree: bool = True,
+        use_eigenvector: bool = True,
+        use_betweenness: bool = True,
+    ) -> "CentralityCache":
 
+        nodes = list(G.nodes())
+
+        deg = {v: 0.0 for v in nodes}
+        eig = {v: 0.0 for v in nodes}
+        bet = {v: 0.0 for v in nodes}
+
+        t_total_0 = time.perf_counter()
+
+        time_degree = 0.0
+        time_eigenvector = 0.0
+        time_betweenness = 0.0
+
+        if use_degree:
+            t0 = time.perf_counter()
+            deg = nx.degree_centrality(G)
+            time_degree = time.perf_counter() - t0
+
+        if use_eigenvector:
+            t0 = time.perf_counter()
+            try:
+                eig = nx.eigenvector_centrality(G, max_iter=500)
+            except nx.PowerIterationFailedConvergence:
+                eig = deg
+            time_eigenvector = time.perf_counter() - t0
+
+        if use_betweenness:
+            t0 = time.perf_counter()
+            bet = nx.betweenness_centrality(G, normalized=True)
+            time_betweenness = time.perf_counter() - t0
+
+        time_total = time.perf_counter() - t_total_0
+
+        return cls(
+            degree=deg,
+            eigenvector=eig,
+            betweenness=bet,
+            time_degree=time_degree,
+            time_eigenvector=time_eigenvector,
+            time_betweenness=time_betweenness,
+            time_total=time_total,
+        )
 
 # ──────────────────────────────────────────────────────────────
 # 4.  HEURISTIC BENEFIT FUNCTION  g(v)
@@ -279,75 +324,126 @@ def simulated_annealing(
                             lam: float = 2.0,
                             rng: Optional[random.Random] = None,
                             apply_final_refinement: bool = True,
-) -> Tuple[Set[int], List[float]]:
+) -> Tuple[Set[int], List[float], Dict[str, float]]:
     """
     Simulated Annealing improvement of a GRASP solution.
 
-    Neighbourhood moves
-    -------------------
-    - ADD    : add a random non-seed node
-    - REMOVE : remove a random seed node
-    - SWAP   : replace one seed node with a non-seed node
-
-    Acceptance criterion  (Metropolis):
-      if ΔE ≤ 0  → accept always
-      else       → accept with probability exp(−ΔE / T)
-
     Returns
     -------
-    best_seed : best (feasible) seed set found
-    history   : list of energy values per temperature step (for plotting)
+    best_seed : best feasible seed set found
+    history   : list of energy values per temperature step
+    stats     : internal statistics of the SA search
     """
     if rng is None:
         rng = random.Random()
 
     nodes = list(G.nodes())
-    current  = set(initial_seed)
-    best     = set(initial_seed)
-    E_curr   = energy(G, current, lam)
-    E_best   = E_curr
-    T        = T_init
+    current = set(initial_seed)
+    best = set(initial_seed)
+
+    E_curr = energy(G, current, lam)
+    E_best = E_curr
+    T = T_init
     history: List[float] = []
+
+    # ── Internal SA statistics ───────────────────────────────
+    total_moves = 0
+    accepted_moves = 0
+
+    infeasible_proposed = 0
+    accepted_infeasible = 0
+    current_infeasible_steps = 0
+
+    uphill_proposed = 0
+    uphill_accepted = 0
+
+    best_updates = 0
 
     while T > T_min:
         for _ in range(steps_per_temp):
             non_seeds = [v for v in nodes if v not in current]
 
-            # Choose a random move type
-            move = rng.choice(["add", "remove", "swap"])
+            feasible_moves = []
+            if non_seeds:
+                feasible_moves.append("add")
+            if len(current) > 1:
+                feasible_moves.append("remove")
+            if non_seeds and current:
+                feasible_moves.append("swap")
 
-            if move == "add" and non_seeds:
-                v = rng.choice(non_seeds)
-                candidate = current | {v}
-            elif move == "remove" and len(current) > 1:
-                v = rng.choice(list(current))
-                candidate = current - {v}
-            elif non_seeds and current:
-                v_in  = rng.choice(list(current))
-                v_out = rng.choice(non_seeds)
-                candidate = (current - {v_in}) | {v_out}
-            else:
+            if not feasible_moves:
                 continue
 
+            move = rng.choice(feasible_moves)
+
+            if move == "add":
+                v = rng.choice(non_seeds)
+                candidate = current | {v}
+
+            elif move == "remove":
+                v = rng.choice(list(current))
+                candidate = current - {v}
+
+            else:  # swap
+                v_in = rng.choice(list(current))
+                v_out = rng.choice(non_seeds)
+                candidate = (current - {v_in}) | {v_out}
+
+            total_moves += 1
+
+            candidate_is_perfect = is_perfect_seed(G, candidate)
+            if not candidate_is_perfect:
+                infeasible_proposed += 1
+
             E_cand = energy(G, candidate, lam)
-            delta  = E_cand - E_curr
+            delta = E_cand - E_curr
 
-            if delta <= 0 or rng.random() < math.exp(-delta / T):
+            accepted = False
+
+            if delta <= 0:
+                accepted = True
+            else:
+                uphill_proposed += 1
+                if rng.random() < math.exp(-delta / T):
+                    accepted = True
+                    uphill_accepted += 1
+
+            if accepted:
                 current = candidate
-                E_curr  = E_cand
+                E_curr = E_cand
+                accepted_moves += 1
 
-            if is_perfect_seed(G, current) and len(current) < len(best):
-                best   = set(current)
+                if not candidate_is_perfect:
+                    accepted_infeasible += 1
+
+            current_is_perfect = is_perfect_seed(G, current)
+            if not current_is_perfect:
+                current_infeasible_steps += 1
+
+            if current_is_perfect and len(current) < len(best):
+                best = set(current)
                 E_best = E_curr
+                best_updates += 1
 
         history.append(E_curr)
         T *= cooling
 
-    # Final refinement pass on the best found solution
     if apply_final_refinement and is_perfect_seed(G, best):
         best = refine(G, best)
 
-    return best, history
+    stats = {
+        "total_moves": total_moves,
+        "accepted_moves": accepted_moves,
+        "infeasible_proposed": infeasible_proposed,
+        "accepted_infeasible": accepted_infeasible,
+        "current_infeasible_steps": current_infeasible_steps,
+        "uphill_proposed": uphill_proposed,
+        "uphill_accepted": uphill_accepted,
+        "best_updates": best_updates,
+    }
+
+    return best, history, stats
+
 
 
 # ──────────────────────────────────────────────────────────────
@@ -363,19 +459,24 @@ class PAPResult:
     time_sa:         float          # seconds
     time_total:      float          # seconds
     sa_history:      List[float]    = field(default_factory=list)
+    sa_stats:        Dict[str, float] = field(default_factory=dict)
     graph_n:         int            = 0
     graph_m:         int            = 0
     graph_edges:     int            = 0
     avg_degree:      float          = 0.0
     density:         float          = 0.0
+    time_centrality: float = 0.0
+    time_degree: float = 0.0
+    time_eigenvector: float = 0.0
+    time_betweenness: float = 0.0
 
 
 def solve_pap(G: nx.Graph,
               n_grasp_iter: int = 10,
               alpha: float = 0.3,
               ad: float = 1.0,
-              ae: float = 1.0,
-              ab: float = 1.0,
+              ae: float = 0.0,
+              ab: float = 0.0,
               T_init: float = 5.0,
               T_min: float = 0.01,
               cooling: float = 0.97,
@@ -386,7 +487,7 @@ def solve_pap(G: nx.Graph,
     Full pipeline: GRASP (multi-start) → best solution → SA improvement.
     """
     rng  = random.Random(seed)
-    cent = CentralityCache.compute(G)
+    cent = CentralityCache.compute(G,use_degree=(ad!=0), use_eigenvector=(ae!=0), use_betweenness=(ab!=0))
     n    = G.number_of_nodes()
 
     # ── GRASP phase ──────────────────────────────────────────
@@ -401,7 +502,7 @@ def solve_pap(G: nx.Graph,
 
     # ── SA phase ─────────────────────────────────────────────
     t1 = time.perf_counter()
-    best_sa, history = simulated_annealing(
+    best_sa, history, sa_stats = simulated_annealing(
         G, best_grasp,
         T_init=T_init, T_min=T_min, cooling=cooling,
         steps_per_temp=steps_per_temp, lam=lam, rng=rng
@@ -417,11 +518,16 @@ def solve_pap(G: nx.Graph,
         is_perfect  = perfect,
         time_grasp  = t_grasp,
         time_sa     = t_sa,
-        time_total  = t_grasp + t_sa,
+        time_total  = cent.time_total + t_grasp + t_sa,
         sa_history  = history,
+        sa_stats = sa_stats,
         graph_n     = n,
         graph_m     = G.number_of_edges(),
         graph_edges = G.number_of_edges(),
         avg_degree  = avg_deg,
         density     = nx.density(G),
+        time_centrality = cent.time_total,
+        time_degree = cent.time_degree,
+        time_eigenvector = cent.time_eigenvector,
+        time_betweenness = cent.time_betweenness,
     )

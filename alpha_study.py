@@ -1,4 +1,6 @@
 import csv
+import random
+import time
 import warnings
 import sys
 
@@ -7,7 +9,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pap_solver import generate_ba_graph, solve_pap
+from pap_solver import (
+    generate_ba_graph,
+    CentralityCache,
+    grasp_construct,
+    refine,
+    is_perfect_seed,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -27,16 +35,13 @@ INSTANCES = [
 ALPHA_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 N_RUNS = 5
-
 GRASP_ITER = 8
 
-T_INIT = 5.0
-T_MIN = 0.01
-COOLING = 0.97
-STEPS = 25
-
-# Valor seleccionado en el estudio de lambda
-LAM = 1.5
+# Configuración de la función de aporte. Se usa solo grado para que el
+# estudio sea coherente con la versión simplificada/final del algoritmo.
+AD = 1.0
+AE = 0.0
+AB = 0.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -66,11 +71,66 @@ def std_value(rows, key):
     return np.nanstd([r[key] for r in rows])
 
 
+def compute_degree_only_cache(G):
+    """
+    Centrality cache using only degree centrality.
+    Eigenvector and betweenness are set to zero because AE=AB=0.
+    This avoids computing unnecessary centralities in the alpha study.
+    """
+    n = G.number_of_nodes()
+
+    if n <= 1:
+        degree = {v: 0.0 for v in G.nodes()}
+    else:
+        degree = {v: G.degree(v) / (n - 1) for v in G.nodes()}
+
+    zero = {v: 0.0 for v in G.nodes()}
+
+    return CentralityCache(
+        degree=degree,
+        eigenvector=zero,
+        betweenness=zero,
+    )
+
+
+def solve_grasp_refine(G, alpha, seed):
+    """
+    Run only GRASP multi-start + refinement, without Simulated Annealing.
+    """
+    rng = random.Random(seed)
+    cent = compute_degree_only_cache(G)
+
+    t0 = time.perf_counter()
+
+    best_seed = set(G.nodes())
+
+    for _ in range(GRASP_ITER):
+        sol = grasp_construct(
+            G,
+            cent,
+            alpha=alpha,
+            ad=AD,
+            ae=AE,
+            ab=AB,
+            rng=rng,
+        )
+
+        sol = refine(G, sol)
+
+        if len(sol) < len(best_seed):
+            best_seed = set(sol)
+
+    time_total = time.perf_counter() - t0
+    perfect = is_perfect_seed(G, best_seed)
+
+    return best_seed, perfect, time_total
+
+
 # ──────────────────────────────────────────────────────────────
 # 3. RUN EXPERIMENT
 # ──────────────────────────────────────────────────────────────
 
-print("Running alpha study...")
+print("Running alpha study with GRASP + refinement only...")
 
 rows = []
 
@@ -85,15 +145,9 @@ for alpha in ALPHA_VALUES:
 
             G = generate_ba_graph(n=n, m=m, seed=seed)
 
-            res = solve_pap(
-                G,
-                n_grasp_iter=GRASP_ITER,
+            seed_set, is_perfect, time_total = solve_grasp_refine(
+                G=G,
                 alpha=alpha,
-                T_init=T_INIT,
-                T_min=T_MIN,
-                cooling=COOLING,
-                steps_per_temp=STEPS,
-                lam=LAM,
                 seed=seed,
             )
 
@@ -102,12 +156,10 @@ for alpha in ALPHA_VALUES:
                 "n": n,
                 "m": m,
                 "run": run,
-                "seed_size": res.seed_size,
-                "seed_ratio": res.seed_size / n,
-                "is_perfect": int(res.is_perfect),
-                "time_total": round(res.time_total, 4),
-                "time_grasp": round(res.time_grasp, 4),
-                "time_sa": round(res.time_sa, 4),
+                "seed_size": len(seed_set),
+                "seed_ratio": len(seed_set) / n,
+                "is_perfect": int(is_perfect),
+                "time_total": round(time_total, 4),
             })
 
             done += 1
@@ -116,8 +168,8 @@ for alpha in ALPHA_VALUES:
                 print(
                     f"[{done:3d}/{total}] "
                     f"alpha={alpha:.1f}, n={n}, m={m}, run={run}, "
-                    f"|S*|={res.seed_size}, ratio={res.seed_size/n:.3f}, "
-                    f"ok={res.is_perfect}"
+                    f"|S*|={len(seed_set)}, ratio={len(seed_set)/n:.3f}, "
+                    f"ok={is_perfect}"
                 )
                 sys.stdout.flush()
 
@@ -162,8 +214,6 @@ csv_keys = [
     "is_best",
     "is_perfect",
     "time_total",
-    "time_grasp",
-    "time_sa",
 ]
 
 with open("results_alpha.csv", "w", newline="") as f:
@@ -209,6 +259,21 @@ with plt.rc_context(STYLE):
         data,
         labels=[str(alpha) for alpha in ALPHA_VALUES],
         showmeans=True,
+        showfliers=False,
+        meanprops=dict(
+            marker="^",
+            markerfacecolor="green",
+            markeredgecolor="green",
+            markersize=9,
+            markeredgewidth=1.5,
+        ),
+        medianprops=dict(
+            color="orange",
+            linewidth=2.5,
+        ),
+        boxprops=dict(linewidth=1.8),
+        whiskerprops=dict(linewidth=1.8),
+        capprops=dict(linewidth=1.8),
     )
 
     ax.set_xlabel(r"$\alpha$")
@@ -302,7 +367,7 @@ print("Saved fig_alpha_seed_ratio_support.png")
 # 10. SUMMARY TABLE
 # ──────────────────────────────────────────────────────────────
 
-print("\n── Alpha sensitivity summary ─────────────────────────────────────────")
+print("\n── Alpha sensitivity summary: GRASP + refinement ─────────────────────")
 print(
     f'{"alpha":>7}  '
     f'{"mean ratio":>10}  '
